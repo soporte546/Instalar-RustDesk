@@ -1,0 +1,129 @@
+# ==================================================
+# Instalación de RustDesk – Sin cuelgues ni fallbacks
+# Basado en el script original, con espera inteligente
+# ==================================================
+Set-ExecutionPolicy Bypass -Scope Process -Force
+
+if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Start-Process PowerShell -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    exit
+}
+
+$installDir  = "C:\Program Files\RustDesk"
+$rdExe       = "$installDir\rustdesk.exe"
+$serviceName = "RustDesk"
+$password    = "Sistemas..22"
+$installer   = "$env:TEMP\rustdesk_setup.exe"
+
+Write-Host "=== Instalador RustDesk (con espera activa) ===" -ForegroundColor Cyan
+
+# 1. Detener procesos previos
+Write-Host "[1/5] Cerrando procesos previos..."
+Stop-Process -Name "rustdesk" -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+
+# 2. Descargar el instalador
+Write-Host "[2/5] Descargando RustDesk..."
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ProgressPreference = 'SilentlyContinue'
+try {
+    Invoke-WebRequest -Uri "https://github.com/rustdesk/rustdesk/releases/download/1.4.6/rustdesk-1.4.6-x86_64.exe" -OutFile $installer -UseBasicParsing -MaximumRedirection 5
+    Write-Host "   Descarga OK."
+} catch {
+    Write-Host "ERROR: No se pudo descargar." -ForegroundColor Red
+    Read-Host "Presiona Enter para salir"
+    exit 1
+}
+
+# 3. Instalar con monitoreo (máximo 120 segundos)
+Write-Host "[3/5] Instalando (monitoreando hasta 120s)..."
+# Eliminar instalación anterior si existe, para evitar interferencias
+if (Test-Path $installDir) {
+    Remove-Item $installDir -Recurse -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+}
+
+$proc = Start-Process -FilePath $installer -ArgumentList "--silent-install" -PassThru
+$maxWait = 120   # segundos
+$elapsed = 0
+$installed = $false
+
+while ($elapsed -lt $maxWait) {
+    Start-Sleep -Seconds 5
+    $elapsed += 5
+    if (Test-Path $rdExe) {
+        $installed = $true
+        break
+    }
+    # Si el proceso ya terminó pero no apareció el .exe, esperamos un poco más
+    if ($proc.HasExited) {
+        Write-Host "   El instalador terminó pero aún no se detecta el ejecutable. Esperando..."
+        Start-Sleep -Seconds 5
+        $elapsed += 5
+        if (Test-Path $rdExe) {
+            $installed = $true
+            break
+        }
+        break
+    }
+}
+
+if (-not $installed) {
+    # Si no apareció, matamos el proceso por si sigue vivo
+    if (-not $proc.HasExited) {
+        Write-Host "   El instalador no terminó en $maxWait segundos. Forzando cierre..."
+        $proc.Kill()
+        Start-Sleep -Seconds 3
+    }
+}
+
+if (-not (Test-Path $rdExe)) {
+    Write-Host "ERROR: La instalación falló. No se encontró $rdExe" -ForegroundColor Red
+    Read-Host "Presiona Enter para salir"
+    exit 1
+}
+
+Write-Host "   RustDesk instalado correctamente."
+
+# 4. Instalar servicio
+Write-Host "[4/5] Configurando servicio..."
+$svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+if ($svc) {
+    Stop-Service $serviceName -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    sc.exe delete $serviceName 2>$null
+    Start-Sleep -Seconds 1
+}
+
+$procSvc = Start-Process -FilePath $rdExe -ArgumentList "--install-service" -PassThru -NoNewWindow
+$procSvc | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
+if (-not $procSvc.HasExited) { $procSvc.Kill() }
+
+if (-not (Get-Service $serviceName -ErrorAction SilentlyContinue)) {
+    sc.exe create $serviceName binPath= "`"$rdExe`" --service" start= auto | Out-Null
+    Start-Sleep -Seconds 2
+}
+
+$svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+if (-not $svc) {
+    Write-Host "ERROR: No se pudo crear el servicio." -ForegroundColor Red
+    Read-Host "Presiona Enter para salir"
+    exit 1
+}
+
+if ($svc.Status -ne 'Running') {
+    Start-Service $serviceName
+    Start-Sleep -Seconds 3
+}
+Write-Host "   Servicio $serviceName : $((Get-Service $serviceName).Status)"
+
+# 5. Establecer contraseña
+Write-Host "[5/5] Estableciendo conexion..."
+& $rdExe --password $password
+Start-Sleep -Seconds 2
+
+Write-Host "===============================" -ForegroundColor Green
+Write-Host "   Fin" -ForegroundColor Cyan
+Write-Host "===============================" -ForegroundColor Green
+
+Read-Host "Presiona Enter para salir"
