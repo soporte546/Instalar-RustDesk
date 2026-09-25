@@ -146,5 +146,4 @@ Write-Host "  [1] Tarea al inicio de sesión (delay 15s)" -ForegroundColor Cyan
 Write-Host "  [2] Tarea al inicio del sistema (SYSTEM)" -ForegroundColor Cyan
 Write-Host "  [3] Registry Run key" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Sobrevive reinicios." -ForegroundColor Yellow
 Write-Host "===============================" -ForegroundColor Green
