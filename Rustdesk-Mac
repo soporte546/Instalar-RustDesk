@@ -1,0 +1,261 @@
+#!/bin/bash
+# Instalación de RustDesk 1.4.6 para macOS administrado (Intel y Apple Silicon).
+# Terminal: sudo /bin/bash instalar-rustdesk-mac.sh
+# MDM (como root): /bin/bash instalar-rustdesk-mac.sh --password-stdin < archivo_del_secreto
+# MDM sin argumentos: lee la primera línea de /var/root/.rustdesk-deploy-password.
+# El archivo del secreto debe ser de root y tener permisos 600 o 400.
+# Registro: /Library/Logs/RustDeskDeploy/deploy.log
+
+set +x
+set -euo pipefail
+umask 077
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export LC_ALL=C
+
+version=1.4.6
+app=/Applications/RustDesk.app
+bin="$app/Contents/MacOS/RustDesk"
+log_dir=/Library/Logs/RustDeskDeploy
+secret_file=/var/root/.rustdesk-deploy-password
+daemon_label=com.carriez.RustDesk_service
+agent_label=com.carriez.RustDesk_server
+daemon_plist="/Library/LaunchDaemons/$daemon_label.plist"
+agent_plist="/Library/LaunchAgents/$agent_label.plist"
+
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+    sed -n '2,7p' "$0"
+    exit 0
+fi
+if [[ $# -gt 1 || ( $# -eq 1 && $1 != --password-stdin ) ]]; then
+    printf 'Uso: %s [--password-stdin]\n' "$0" >&2
+    exit 2
+fi
+if [[ $(uname -s) != Darwin ]]; then
+    printf 'Este script se ejecuta en macOS.\n' >&2
+    exit 1
+fi
+if [[ $EUID -ne 0 ]]; then
+    if [[ -t 2 ]]; then
+        exec /usr/bin/sudo /bin/bash "$0" "$@"
+    fi
+    printf 'Ejecuta el script como root desde tu MDM.\n' >&2
+    exit 1
+fi
+
+fail() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+unset rustdesk_password
+rustdesk_password=
+if [[ ${1:-} == --password-stdin ]]; then
+    IFS= read -r rustdesk_password || [[ -n $rustdesk_password ]] ||
+        fail 'No se recibió la contraseña por la entrada estándar.'
+elif [[ -t 0 && -t 2 ]]; then
+    IFS= read -r -s -p 'Nueva contraseña permanente de RustDesk: ' rustdesk_password
+    printf '\n' >&2
+else
+    [[ -f $secret_file && ! -L $secret_file ]] ||
+        fail "Proporciona la contraseña por stdin o mediante $secret_file."
+    case $(stat -f '%u:%Lp' "$secret_file") in
+        0:600|0:400) ;;
+        *) fail "$secret_file debe pertenecer a root y tener permisos 600 o 400." ;;
+    esac
+    IFS= read -r rustdesk_password < "$secret_file" || [[ -n $rustdesk_password ]] ||
+        fail "El archivo $secret_file está vacío."
+fi
+[[ -n $rustdesk_password && $rustdesk_password != *$'\r'* ]] ||
+    fail 'Indica una contraseña válida en una sola línea.'
+
+[[ ! -L $log_dir ]] || fail "Ruta de registro inesperada: $log_dir"
+mkdir -p "$log_dir"
+chown root:wheel "$log_dir"
+chmod 700 "$log_dir"
+[[ ! -L $log_dir/deploy.log ]] || fail 'La ruta del archivo de registro es un enlace.'
+exec > >(tee -a "$log_dir/deploy.log") 2>&1
+
+# El bloqueo evita reemplazar el bundle si dos despliegues coinciden.
+lock_dir="$log_dir/install.lock"
+mkdir "$lock_dir" 2>/dev/null || fail "Ya hay una instalación en curso o quedó un bloqueo en $lock_dir."
+stage=
+mount_dir=
+mounted=0
+cleanup() {
+    local status=$?
+    trap - EXIT
+    if [[ $mounted == 1 ]]; then
+        if ! hdiutil detach "$mount_dir" -quiet; then
+            printf 'No se pudo desmontar el DMG en %s.\n' "$mount_dir" >&2
+            rmdir "$lock_dir" || true
+            exit 1
+        fi
+    fi
+    if [[ -n $stage ]]; then
+        # Si el reemplazo se interrumpió, recuperar el bundle anterior.
+        if [[ -d $stage/previous.app && ! -e $app ]]; then
+            if ! mv "$stage/previous.app" "$app"; then
+                printf 'La instalación anterior se conserva en %s/previous.app.\n' "$stage" >&2
+                rmdir "$lock_dir" || true
+                exit 1
+            fi
+        fi
+        rm -rf "$stage"
+    fi
+    rmdir "$lock_dir"
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+download() {
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+        --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 240 \
+        --output "$2" "$1"
+}
+
+stop_job() {
+    if launchctl print "$1" >/dev/null 2>&1; then
+        launchctl bootout "$1"
+    fi
+}
+
+start_job() {
+    local domain=$1 label=$2 plist=$3 state
+    launchctl enable "$domain/$label" || return 1
+    launchctl bootstrap "$domain" "$plist" || return 1
+    for ((attempt=1; attempt<=15; attempt++)); do
+        state=$(launchctl print "$domain/$label" 2>/dev/null) || state=
+        if grep -Eq '^[[:space:]]*state = running[[:space:]]*$' <<< "$state"; then
+            return 0
+        fi
+        sleep 1
+    done
+    launchctl print "$domain/$label" >&2 || true
+    return 1
+}
+
+if [[ $(sysctl -n hw.optional.arm64 2>/dev/null || true) == 1 ]]; then
+    arch=aarch64
+    checksum=0cd498e3f99c878bfa3c54996089b9671fdd15aee5d1ac160444841f95ea01bc
+elif [[ $(uname -m) == x86_64 ]]; then
+    arch=x86_64
+    checksum=7d0daf81a80a9861661c0e89321f302760fad9e384247f2c1a9acd9f45705c55
+else
+    fail 'Arquitectura no compatible.'
+fi
+
+printf '=== Instalador RustDesk %s para macOS (%s) ===\n' "$version" "$arch"
+printf '[1/6] Descargando y verificando el DMG y las plantillas de launchd...\n'
+stage=$(mktemp -d /Applications/.RustDeskDeploy.XXXXXXXX)
+mount_dir="$stage/dmg"
+dmg="$stage/RustDesk.dmg"
+templates="https://raw.githubusercontent.com/rustdesk/rustdesk/$version/src/platform/privileges_scripts"
+download "https://github.com/rustdesk/rustdesk/releases/download/$version/rustdesk-$version-$arch.dmg" "$dmg" ||
+    fail 'Falló la descarga del DMG.'
+printf '%s  %s\n' "$checksum" "$dmg" | shasum -a 256 -c - ||
+    fail 'El SHA-256 del DMG no coincide con el publicado por RustDesk.'
+download "$templates/daemon.plist" "$stage/daemon.plist" || fail 'No se pudo descargar el LaunchDaemon.'
+download "$templates/agent.plist" "$stage/agent.plist" || fail 'No se pudo descargar el LaunchAgent.'
+
+mkdir "$mount_dir"
+hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount_dir" -quiet ||
+    fail 'No se pudo montar el DMG.'
+mounted=1
+[[ -x $mount_dir/RustDesk.app/Contents/MacOS/RustDesk &&
+   -x $mount_dir/RustDesk.app/Contents/MacOS/service ]] ||
+    fail 'No se encontraron la aplicación y el ejecutable de servicio en el DMG.'
+ditto "$mount_dir/RustDesk.app" "$stage/RustDesk.app"
+hdiutil detach "$mount_dir" -quiet || fail 'No se pudo desmontar el DMG.'
+mounted=0
+chown -R root:wheel "$stage/RustDesk.app"
+chmod -R go-w "$stage/RustDesk.app"
+
+plist_buddy=/usr/libexec/PlistBuddy
+bundle_id=$("$plist_buddy" -c 'Print :CFBundleIdentifier' "$stage/RustDesk.app/Contents/Info.plist")
+[[ $bundle_id == com.carriez.[Rr]ust[Dd]esk ]] || fail 'Identificador de bundle inesperado.'
+for template in "$stage/daemon.plist" "$stage/agent.plist"; do
+    "$plist_buddy" -c "Set :AssociatedBundleIdentifiers $bundle_id" "$template" >/dev/null
+done
+# Guardar los logs del proceso privilegiado en una ruta controlada por root.
+"$plist_buddy" -c "Set :StandardErrorPath $log_dir/service.err" "$stage/daemon.plist"
+"$plist_buddy" -c "Set :StandardOutPath $log_dir/service.out" "$stage/daemon.plist"
+plutil -lint "$stage/daemon.plist" "$stage/agent.plist"
+[[ $("$plist_buddy" -c 'Print :Label' "$stage/daemon.plist") == "$daemon_label" &&
+   $("$plist_buddy" -c 'Print :Label' "$stage/agent.plist") == "$agent_label" ]] ||
+    fail 'Las etiquetas de launchd no coinciden.'
+
+printf '[2/6] Deteniendo RustDesk anterior...\n'
+gui_domain=
+console_uid=$(stat -f '%u' /dev/console)
+if [[ $console_uid -ne 0 ]] && launchctl print "gui/$console_uid" >/dev/null 2>&1; then
+    gui_domain="gui/$console_uid"
+    stop_job "$gui_domain/$agent_label" || fail 'No se pudo detener el agente anterior.'
+fi
+stop_job "system/$daemon_label" || fail 'No se pudo detener el servicio anterior.'
+process_pattern='^/Applications/RustDesk[.]app/Contents/MacOS/(RustDesk|service)( |$)'
+pkill -TERM -f "$process_pattern" || true
+for ((attempt=1; attempt<=10; attempt++)); do
+    pgrep -f "$process_pattern" >/dev/null || break
+    sleep 1
+done
+if pgrep -f "$process_pattern" >/dev/null; then
+    fail 'Todavía hay procesos de RustDesk en ejecución. Cierra las sesiones y vuelve a intentarlo.'
+fi
+
+printf '[3/6] Instalando en Aplicaciones...\n'
+[[ ! -L $app ]] || fail 'La ruta de RustDesk.app es un enlace simbólico.'
+if [[ -e $app ]]; then
+    [[ -d $app ]] || fail 'La ruta de RustDesk.app está ocupada.'
+    mv "$app" "$stage/previous.app"
+fi
+mv "$stage/RustDesk.app" "$app" || fail 'No se pudo instalar RustDesk.app.'
+[[ -x $bin ]] || fail 'No se encontró el ejecutable instalado.'
+
+printf '[4/6] Registrando el servicio y el agente de inicio...\n'
+mkdir -p /Library/LaunchDaemons /Library/LaunchAgents
+chown root:wheel "$stage/daemon.plist" "$stage/agent.plist"
+chmod 644 "$stage/daemon.plist" "$stage/agent.plist"
+mv -f "$stage/daemon.plist" "$daemon_plist"
+mv -f "$stage/agent.plist" "$agent_plist"
+start_job system "$daemon_label" "$daemon_plist" || fail "El servicio no arrancó. Revisa $log_dir/service.err."
+if [[ -n $gui_domain ]]; then
+    start_job "$gui_domain" "$agent_label" "$agent_plist" || fail 'El agente de la sesión gráfica no arrancó.'
+else
+    printf 'No hay sesión gráfica activa. El agente se cargará al iniciar sesión.\n'
+fi
+
+printf '[5/6] Configurando la contraseña permanente...\n'
+# La opción stop-service puede quedar guardada al desinstalar el helper desde RustDesk.
+"$bin" --option stop-service '' >/dev/null 2>&1
+password_ok=0
+for ((attempt=1; attempt<=5; attempt++)); do
+    # RustDesk puede salir con código 0 aunque la operación CLI haya fallado.
+    if response=$("$bin" --password "$rustdesk_password" 2>/dev/null) &&
+        grep -qx 'Done!' <<< "$response"; then
+        password_ok=1
+        break
+    fi
+    sleep 2
+done
+unset rustdesk_password response
+
+printf '[6/6] Obteniendo el ID de RustDesk...\n'
+rd_id=
+for ((attempt=1; attempt<=5; attempt++)); do
+    response=$("$bin" --get-id 2>/dev/null) || response=
+    candidate=$(awk '/^[[:space:]]*[[:alnum:]_-]+[[:space:]]*$/ { print $1 }' <<< "$response")
+    if [[ $candidate =~ ^[[:alnum:]_][[:alnum:]_-]{5,15}$ ]]; then
+        rd_id=$candidate
+        break
+    fi
+    sleep 2
+done
+
+printf 'Equipo: %s\n' "$(scutil --get ComputerName 2>/dev/null || hostname)"
+printf 'ID de RustDesk: %s\n' "${rd_id:-no disponible}"
+[[ $password_ok == 1 ]] ||
+    fail 'RustDesk no confirmó la contraseña. Abre una sesión gráfica y vuelve a ejecutar el instalador.'
+[[ -n $rd_id ]] || fail 'RustDesk no devolvió un ID válido.'
+printf 'Instalación completada. Registro: %s/deploy.log\n' "$log_dir"
